@@ -1,0 +1,252 @@
+var districts = ee.FeatureCollection("FAO/GAUL/2015/level2")
+  .filter(ee.Filter.eq('ADM0_NAME','Bangladesh'));
+
+var SCALE = 90; 
+
+var panel = ui.Panel({style:{width:'320px'}});
+panel.add(ui.Label('Smart Geospatial Landslide Risk Prediction & Alert System',
+  {fontSize:'16px', fontWeight:'bold'}));
+
+var names = districts.aggregate_array('ADM2_NAME').sort().getInfo();
+
+var select = ui.Select({items:names, placeholder:'Select District'});
+panel.add(select);
+
+var dateBox = ui.Textbox({value:'2024-06-01'});
+panel.add(dateBox);
+
+var output = ui.Label('');
+panel.add(output);
+
+ui.root.insert(0,panel);
+
+
+var btn = ui.Button({
+  label:'Run Analysis',
+  onClick:function(){
+
+    Map.clear();
+
+    var districtName = select.getValue();
+    var date = dateBox.getValue();
+
+    var AOI = districts.filter(ee.Filter.eq('ADM2_NAME', districtName));
+
+    Map.centerObject(AOI,10);
+    Map.addLayer(AOI, {color:'black'}, 'Boundary');
+
+
+
+    var landslidePoints = ee.FeatureCollection(
+      'projects/ee-pritomboseaapon/assets/bangladesh_landslides_with_gee'
+    ).map(function(f){ return f.set('label',1); });
+
+    
+    landslidePoints = landslidePoints.filterBounds(AOI);
+
+    Map.addLayer(landslidePoints, {color:'red'}, 'Landslides');
+
+
+
+    var nonLandslide = ee.FeatureCollection.randomPoints({
+      region: AOI,
+      points: 500,
+      seed: 1
+    }).map(function(f){ return f.set('label',0); });
+
+    var trainingPoints = landslidePoints.merge(nonLandslide);
+
+
+
+    var dem = ee.Image("USGS/SRTMGL1_003").clip(AOI);
+    var slope = ee.Terrain.slope(dem);
+
+    var s2 = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+      .filterBounds(AOI)
+      .filterDate('2021-01-01','2022-12-31')
+      .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE',10))
+      .median();
+
+    var ndvi = s2.normalizedDifference(['B8','B4']).rename('ndvi');
+
+
+    var slopeClass = slope.expression(
+      "(b('slope') < 10) ? 1" +
+      ": (b('slope') < 20) ? 2" +
+      ": (b('slope') < 30) ? 3" +
+      ": 4"
+    ).rename('class');
+
+    var ndviClass = ndvi.expression(
+      "(b('ndvi') < 0.2) ? 1" +
+      ": (b('ndvi') < 0.4) ? 2" +
+      ": (b('ndvi') < 0.6) ? 3" +
+      ": 4"
+    ).rename('class');
+
+
+
+    function computeFR(img){
+
+      var sampled = img.sampleRegions({
+        collection: trainingPoints,
+        scale: SCALE
+      });
+
+      var totalLS = sampled.filter(ee.Filter.eq('label',1)).size();
+      var total   = sampled.size();
+
+      return ee.List.sequence(1,4).map(function(c){
+
+        var subset = sampled.filter(ee.Filter.eq('class',c));
+
+        var ls = subset.filter(ee.Filter.eq('label',1)).size();
+        var tot = subset.size();
+
+        var pctLS = ee.Number(ls).divide(totalLS);
+        var pctArea = ee.Number(tot).divide(total);
+
+
+        return ee.Algorithms.If(
+          pctArea.gt(0),
+          pctLS.divide(pctArea).max(0.01),
+          0.01
+        );
+      });
+    }
+
+    var frSlope = computeFR(slopeClass);
+    var frNDVI  = computeFR(ndviClass);
+
+
+
+    function buildWeight(img, frList){
+
+      var sum = ee.Number(frList.reduce(ee.Reducer.sum()));
+
+      return ee.ImageCollection(
+        ee.List.sequence(0,3).map(function(i){
+
+          var cls = ee.Number(i).add(1);
+          var w = ee.Number(frList.get(i)).divide(sum);
+
+          return img.eq(cls)
+            .multiply(ee.Image.constant(w))
+            .toFloat();
+        })
+      ).sum().toFloat();
+    }
+
+    var wiSlope = buildWeight(slopeClass, frSlope);
+    var wiNDVI  = buildWeight(ndviClass, frNDVI);
+
+    var LSI = wiSlope.add(wiNDVI).rename('LSI');
+
+    var stats = LSI.reduceRegion({
+      reducer: ee.Reducer.minMax(),
+      geometry: AOI,
+      scale: SCALE,
+      maxPixels: 1e10
+    });
+
+    var minLSI = ee.Number(stats.get('LSI_min'));
+    var maxLSI = ee.Number(stats.get('LSI_max'));
+
+    var LSI_norm = LSI.subtract(minLSI)
+      .divide(maxLSI.subtract(minLSI));
+
+
+    var rain = ee.ImageCollection("UCSB-CHG/CHIRPS/DAILY")
+    .filterDate(ee.Date(date).advance(-3,'day'), ee.Date(date))
+    .sum()
+    .clip(AOI);
+
+
+    rain = ee.Image(ee.Algorithms.If(
+      rain.bandNames().size().gt(0),
+      rain,
+      ee.Image.constant(0)
+    )).rename('rain');
+
+    var rainNorm = rain.divide(100).clamp(0,1);
+
+
+    var finalRisk = LSI_norm.multiply(rainNorm.add(0.5));
+
+
+    Map.addLayer(finalRisk, {
+      min: 0,
+      max: 1,
+      palette: ['green','yellow','orange','red']
+    }, 'Landslide Risk');
+
+
+var legend = ui.Panel({
+  style: {
+    position: 'bottom-left',
+    padding: '8px 15px'
+  }
+});
+
+
+legend.add(ui.Label({
+  value: 'Risk Level',
+  style: {fontWeight: 'bold', fontSize: '14px'}
+}));
+
+
+function makeRow(color, name) {
+  var colorBox = ui.Label({
+    style: {
+      backgroundColor: color,
+      padding: '8px',
+      margin: '0 0 4px 0'
+    }
+  });
+
+  var description = ui.Label({
+    value: name,
+    style: {margin: '0 0 4px 6px'}
+  });
+
+  return ui.Panel({
+    widgets: [colorBox, description],
+    layout: ui.Panel.Layout.Flow('horizontal')
+  });
+}
+
+
+legend.add(makeRow('green', 'No Warning'));
+legend.add(makeRow('yellow', 'Caution'));
+legend.add(makeRow('orange', 'Alert'));
+legend.add(makeRow('red', 'Alarm'));
+
+
+Map.add(legend);
+
+
+    var meanRain = rain.reduceRegion({
+      reducer: ee.Reducer.mean(),
+      geometry: AOI,
+      scale: 5000
+    }).get('rain');
+
+    ee.Number(meanRain).evaluate(function(v){
+
+      if(v === null){
+        output.setValue('No rainfall data');
+      }
+      else if(v > 100){
+        output.setValue('🚨 HIGH RISK');
+      }
+      else if(v > 50){
+        output.setValue('⚠ MODERATE RISK');
+      }
+      else{
+        output.setValue('✅ LOW RISK');
+      }
+    });
+  }
+});
+
+panel.add(btn);
